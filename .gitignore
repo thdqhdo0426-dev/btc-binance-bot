@@ -1,0 +1,30 @@
+# API 키 보호 (절대 GitHub에 올리면 안 됨!)
+config.py
+
+# 거래 데이터/로그 (서버에서 쌓이는 것)
+data/
+logs/
+
+# Python 가상환경
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 테스트용 임시 파일
+test_keys.py
+test_ping.py
+test_final.py
+check_qty.py
+check_now.py

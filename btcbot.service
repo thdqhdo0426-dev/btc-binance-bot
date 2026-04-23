@@ -1,0 +1,16 @@
+[Unit]
+Description=BTC Binance Futures Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/btc_binance_bot
+ExecStart=/home/ubuntu/btc_binance_bot/venv/bin/python main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ubuntu/btc_binance_bot/logs/systemd.log
+StandardError=append:/home/ubuntu/btc_binance_bot/logs/systemd.err
+
+[Install]
+WantedBy=multi-user.target
