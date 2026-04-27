@@ -317,16 +317,77 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
         notifier.notify_error(f"진입 주문 실패: {e}")
         return
     
-    # 2. TP/SL 지정가 주문 (reduceOnly, 진입 체결 전에도 대기 가능)
-    try:
-        tp_order, sl_order = executor.place_tp_sl_limit(
-            side, quantity, tp_price, sl_price
-        )
-    except Exception as e:
-        logger.exception(f"TP/SL 주문 실패: {e}")
-        # 진입 주문 취소하고 종료
-        executor.cancel_order(entry_order.get('orderId'))
-        notifier.notify_error(f"TP/SL 주문 실패 - 진입 취소: {e}")
+    # 2. TP/SL 주문 (재시도 로직 포함)
+    tp_order, sl_order = None, None
+    last_error = None
+    
+    for attempt in range(3):  # 최대 3회 재시도
+        try:
+            tp_order, sl_order = executor.place_tp_sl_limit(
+                side, quantity, tp_price, sl_price
+            )
+            if attempt > 0:
+                logger.info(f"TP/SL 주문 성공 (재시도 {attempt}회 후)")
+            break  # 성공
+        except Exception as e:
+            last_error = e
+            logger.warning(f"TP/SL 주문 실패 (시도 {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)  # 3초 대기 후 재시도
+    
+    if tp_order is None:
+        # 3회 재시도 모두 실패
+        logger.exception(f"TP/SL 주문 3회 재시도 모두 실패: {last_error}")
+        
+        # 진입 체결 여부 확인
+        try:
+            entry_filled, _ = is_entry_filled(executor, {
+                'entry_order_id': str(entry_order.get('orderId')),
+                'entry_price': entry_limit
+            })
+        except Exception:
+            entry_filled = False
+        
+        if entry_filled:
+            # 진입 체결된 상태 → 자동 청산 안 함, 사람이 결정하도록 긴급 알림
+            logger.critical("⚠️ 진입 체결됨 + TP/SL 실패 → 사용자 수동 처리 필요")
+            notifier.send_telegram(
+                f"🚨 <b>긴급! 수동 TP/SL 설정 필요!</b>\n\n"
+                f"진입은 체결됐으나 TP/SL 주문이 3회 실패했습니다.\n"
+                f"<b>지금 즉시 바이낸스 앱에서 TP/SL을 수동 설정하세요!</b>\n\n"
+                f"방향: {side}\n"
+                f"수량: {quantity} BTC\n"
+                f"진입가: {entry_limit:.2f}\n"
+                f"권장 TP: {tp_price:.2f}\n"
+                f"권장 SL: {sl_price:.2f}\n\n"
+                f"⚠️ 봇은 자동 청산하지 않습니다.\n"
+                f"청산 후엔 봇이 5분 내 자동 감지하여 사이클 종료합니다.\n\n"
+                f"에러: {str(last_error)[:150]}"
+            )
+            
+            # DB에 사이클 등록 (봇이 청산 감지하도록)
+            bar_start = get_current_bar_open_time()
+            max_hold_until = bar_start + timedelta(hours=4 * config.MAX_HOLD_BARS)
+            db.save_position({
+                'side': side,
+                'entry_time': datetime.now(UTC).isoformat(),
+                'entry_price': entry_limit,
+                'entry_open_price': bar_open_price,
+                'quantity': quantity,
+                'leverage': config.LEVERAGE,
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'entry_bar_time': bar_start.isoformat(),
+                'max_hold_until': max_hold_until.isoformat(),
+                'entry_order_id': str(entry_order.get('orderId')),
+                'tp_order_id': 'MANUAL',  # 수동 설정 표시
+                'sl_order_id': 'MANUAL',
+            })
+            logger.info("진입 사이클 DB 등록 완료 (TP/SL은 사용자가 수동 설정)")
+        else:
+            # 진입 미체결 → 진입 주문 취소
+            executor.cancel_order(entry_order.get('orderId'))
+            notifier.notify_error(f"TP/SL 3회 실패 - 진입 취소: {last_error}")
         return
     
     # 3. 진입봉 시작 시각 + N봉 = 청산 시각

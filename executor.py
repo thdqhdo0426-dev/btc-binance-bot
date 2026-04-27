@@ -176,48 +176,78 @@ class BinanceFuturesExecutor:
     def place_tp_sl_limit(self, side: str, quantity: float,
                           tp_price: float, sl_price: float) -> tuple:
         """
-        TP/SL 지정가 주문 (LIMIT + reduceOnly)
-        - TP: 반대 방향 LIMIT 주문 (reduceOnly=True)
-        - SL: 반대 방향 STOP (stopPrice 터치 시 LIMIT 주문 발동)
+        TP/SL 주문 제출
+        - TP: LIMIT (지정가, 정확한 가격에서 익절)
+        - SL: STOP_MARKET (시장가, 가격 도달 시 무조건 체결로 손실 제한)
+        
+        설계 결정:
+        - reduceOnly 제거: 진입 미체결 시 -2022 에러 방지
+        - SL은 STOP_MARKET: 일반 STOP 타입은 -4120 거부, STOP_MARKET은 OK
+        - SL이 시장가인 이유: 가격 급락 시에도 무조건 체결되어 손실 무한정 방지
         """
         exit_side = SIDE_SELL if side == "LONG" else SIDE_BUY
         tp_price = self._round_price(tp_price)
         sl_price = self._round_price(sl_price)
         
         if config.DRY_RUN:
-            logger.info(f"[DRY_RUN] TP LIMIT @ {tp_price:.2f} / SL STOP LIMIT @ {sl_price:.2f}")
+            logger.info(f"[DRY_RUN] TP LIMIT @ {tp_price:.2f} / SL STOP_MARKET @ {sl_price:.2f}")
             return ({'orderId': 'DRY_TP'}, {'orderId': 'DRY_SL'})
         
-        # TP: LIMIT reduceOnly
+        # TP: LIMIT (지정가 익절)
         tp_order = self.client.futures_create_order(
             symbol=self.symbol,
             side=exit_side,
             type=ORDER_TYPE_LIMIT,
             timeInForce=TIME_IN_FORCE_GTC,
             quantity=quantity,
-            price=str(tp_price),
-            reduceOnly=True
+            price=str(tp_price)
         )
         
-        # SL: STOP 타입 (stopPrice 도달 시 price로 LIMIT 발동)
+        # SL: STOP_MARKET (가격 도달 시 시장가 청산)
         sl_order = self.client.futures_create_order(
             symbol=self.symbol,
             side=exit_side,
-            type='STOP',
-            timeInForce=TIME_IN_FORCE_GTC,
+            type='STOP_MARKET',
             quantity=quantity,
-            price=str(sl_price),
             stopPrice=str(sl_price),
-            reduceOnly=True,
             workingType='MARK_PRICE'
         )
         
         logger.info(
-            f"TP/SL 지정가 주문 제출: "
+            f"TP/SL 주문 제출: "
             f"TP(LIMIT)={tp_order.get('orderId')} @{tp_price:.2f} / "
-            f"SL(STOP_LIMIT)={sl_order.get('orderId')} @{sl_price:.2f}"
+            f"SL(STOP_MARKET)={sl_order.get('orderId')} @{sl_price:.2f}"
         )
         return tp_order, sl_order
+    
+    def emergency_close_position(self, side: str, quantity: float) -> dict:
+        """
+        긴급 시장가 청산 (TP/SL 실패로 무방비 포지션 보유 시 사용)
+        
+        시나리오:
+        - 진입 LIMIT 즉시 체결됐는데 TP/SL 주문이 실패한 경우
+        - 진입 취소 시도하지만 이미 체결되어 취소 불가
+        - 이때 호출하여 포지션을 즉시 시장가로 정리
+        """
+        exit_side = SIDE_SELL if side == "LONG" else SIDE_BUY
+        
+        if config.DRY_RUN:
+            logger.warning(f"[DRY_RUN] 긴급 시장가 청산 {side} {quantity}")
+            return {'orderId': 'DRY_EMERGENCY'}
+        
+        try:
+            order = self.client.futures_create_order(
+                symbol=self.symbol,
+                side=exit_side,
+                type=ORDER_TYPE_MARKET,
+                quantity=quantity,
+                reduceOnly=True
+            )
+            logger.warning(f"⚠️ 긴급 시장가 청산 완료: {order}")
+            return order
+        except Exception as e:
+            logger.error(f"긴급 청산도 실패! 즉시 바이낸스 앱에서 수동 청산 필요: {e}")
+            raise
     
     def cancel_order(self, order_id) -> bool:
         """주문 취소"""
