@@ -540,15 +540,15 @@ def run_bot():
             logger.info(f"다음 체크: {check_time.isoformat()}")
             
             # 2. 대기 루프 (적응형 체크 주기)
-            #    - 포지션 보유 중 (체결됨)    → 1초마다 (가상 TP/SL 실시간)
+            #    - 포지션 보유 중 (체결됨)    → 0.33초마다 (가상 TP/SL 실시간, 1초에 3번)
             #    - 진입 미체결 사이클 있음    → 10초마다 (체결 감지)
             #    - 사이클 없음               → 5분마다 (효율적)
             while datetime.now(UTC) < check_time:
-                # 1. 가상 TP/SL 체크 (포지션 보유 시 1초마다)
+                # 1. 가상 TP/SL 체크 (포지션 보유 시 0.33초마다)
                 pos = db.get_open_position()
                 
                 if pos and pos.get('tp_order_id') == 'VIRTUAL':
-                    # 포지션 보유 중 → 1초마다 가상 TP/SL 체크
+                    # 포지션 보유 중 → 0.33초마다 가상 TP/SL 체크 (1초에 3번)
                     if virtual_tp_sl_check(executor):
                         # 청산 발동됨
                         continue
@@ -557,7 +557,7 @@ def run_bot():
                     if datetime.now(UTC).second < 1:
                         check_cycle_status(executor)
                     
-                    sleep_sec = 1
+                    sleep_sec = 0.33  # 1초에 3번
                 
                 elif pos and (not pos.get('tp_order_id') or not pos.get('sl_order_id')):
                     # 진입 미체결 → 10초마다 체결 확인
@@ -570,7 +570,7 @@ def run_bot():
                     sleep_sec = 300
                 
                 remaining = (check_time - datetime.now(UTC)).total_seconds()
-                time.sleep(min(max(remaining, 1), sleep_sec))
+                time.sleep(min(max(remaining, 0.1), sleep_sec))
             
             logger.info("=== 4시간봉 마감 ===")
             
