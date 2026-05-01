@@ -177,7 +177,7 @@ def retry_signal():
     
     print("[OK] Entry order: {}".format(entry_order.get('orderId')))
     
-    # DB에 사이클 등록 (TP/SL은 NULL로, 봇이 체결 후 부착)
+    # DB에 사이클 등록 (TP/SL은 NULL로, 봇이 체결 후 가상 모드 활성화)
     max_hold_until = bar_start + timedelta(hours=4 * config.MAX_HOLD_BARS)
     
     position_id = db.save_position({
@@ -192,7 +192,7 @@ def retry_signal():
         'entry_bar_time': bar_start.isoformat(),
         'max_hold_until': max_hold_until.isoformat(),
         'entry_order_id': str(entry_order.get('orderId')),
-        'tp_order_id': None,  # 봇이 체결 후 부착
+        'tp_order_id': None,  # 봇이 체결 후 'VIRTUAL'로 표시
         'sl_order_id': None,
     })
     
