@@ -239,25 +239,123 @@ def close_cycle_at_timeout(executor: BinanceFuturesExecutor, pos: dict):
         )
 
 
+def attach_tp_sl_if_filled(executor: BinanceFuturesExecutor, pos: dict) -> bool:
+    """
+    진입 체결 후 TP/SL 부착 (아직 부착 전인 사이클 대상)
+    
+    Returns:
+        True: TP/SL 부착 시도함 (성공/실패 상관없이)
+        False: 아직 부착 시점 아님 (진입 미체결)
+    """
+    # 이미 부착됐으면 스킵
+    if pos.get('tp_order_id') and pos.get('sl_order_id'):
+        return False
+    
+    # 진입 체결 확인
+    entry_filled, entry_avg = is_entry_filled(executor, pos)
+    if not entry_filled:
+        return False
+    
+    # 체결됨! 실제 체결가로 업데이트
+    if entry_avg > 0:
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE positions SET entry_price = ? WHERE id = ?",
+                (entry_avg, pos['id'])
+            )
+        pos['entry_price'] = entry_avg
+        logger.info(f"진입 체결 감지! 실체결가: {entry_avg}")
+    
+    # TP/SL 주문 부착 (재시도 3회)
+    tp_order, sl_order = None, None
+    last_error = None
+    
+    for attempt in range(3):
+        try:
+            tp_order, sl_order = executor.place_tp_sl_limit(
+                pos['side'], pos['quantity'],
+                pos['tp_price'], pos['sl_price']
+            )
+            if attempt > 0:
+                logger.info(f"TP/SL 부착 성공 (재시도 {attempt}회 후)")
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning(f"TP/SL 부착 실패 (시도 {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
+    
+    if tp_order and sl_order:
+        # DB에 주문 ID 저장
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE positions SET tp_order_id = ?, sl_order_id = ? WHERE id = ?",
+                (str(tp_order.get('orderId')), str(sl_order.get('orderId')), pos['id'])
+            )
+        logger.info(
+            f"TP/SL 부착 완료: TP={tp_order.get('orderId')} / SL={sl_order.get('orderId')}"
+        )
+        notifier.send_telegram(
+            f"✅ <b>진입 체결 + TP/SL 부착</b>\n"
+            f"방향: {pos['side']}\n"
+            f"실체결가: {entry_avg:.2f}\n"
+            f"TP: {pos['tp_price']:.2f}\n"
+            f"SL: {pos['sl_price']:.2f}"
+        )
+    else:
+        # TP/SL 부착 실패 → 사용자 알림 (자동 청산 안 함)
+        logger.critical(f"TP/SL 부착 3회 실패: {last_error}")
+        notifier.send_telegram(
+            f"🚨 <b>긴급! 수동 TP/SL 설정 필요!</b>\n\n"
+            f"진입 체결됐으나 TP/SL 부착이 3회 실패했습니다.\n"
+            f"<b>지금 즉시 바이낸스 앱에서 TP/SL을 수동 설정하세요!</b>\n\n"
+            f"방향: {pos['side']}\n"
+            f"수량: {pos['quantity']} BTC\n"
+            f"진입가: {entry_avg:.2f}\n"
+            f"권장 TP: {pos['tp_price']:.2f}\n"
+            f"권장 SL: {pos['sl_price']:.2f}\n\n"
+            f"⚠️ 봇은 자동 청산하지 않습니다.\n"
+            f"청산 후엔 봇이 5분 내 자동 감지하여 사이클 종료합니다.\n\n"
+            f"에러: {str(last_error)[:150]}"
+        )
+        # DB에는 'MANUAL' 표시 (다음 사이클 부착 시도 안 함)
+        with db.get_db() as conn:
+            conn.execute(
+                "UPDATE positions SET tp_order_id = 'MANUAL', sl_order_id = 'MANUAL' WHERE id = ?",
+                (pos['id'],)
+            )
+    
+    return True
+
+
 def check_cycle_status(executor: BinanceFuturesExecutor):
     """
     주기적으로 호출 (5분마다):
+    - 진입 체결 감지 → TP/SL 부착 (NEW)
     - TP/SL 체결 감지 → DB 동기화
     - N봉 종가 시점 도달 확인 → 사이클 종료
-    - 진입 체결 감지 → 실체결가 반영
     """
     pos = db.get_open_position()
     if not pos:
         return
     
-    # 1. 진입 체결됐으면 실체결가 업데이트
-    sync_entry_price_if_filled(executor, pos)
+    # 1. TP/SL 아직 부착 안 됐으면 → 진입 체결 확인 + 부착 시도
+    if not pos.get('tp_order_id') or not pos.get('sl_order_id'):
+        attach_tp_sl_if_filled(executor, pos)
+        # 다시 가져오기 (방금 업데이트된 정보 반영)
+        pos = db.get_open_position()
+        if not pos:
+            return
     
-    # 2. TP/SL 체결 확인 (체결됐으면 여기서 종료됨)
+    # 2. 이미 부착됐거나 방금 부착 완료된 경우 → 진입가 동기화
+    if pos.get('tp_order_id') and pos['tp_order_id'] not in (None, 'MANUAL'):
+        sync_entry_price_if_filled(executor, pos)
+    
+    # 3. TP/SL 체결 확인 (체결됐으면 여기서 종료됨)
     if check_tp_sl_filled(executor, pos):
         return
     
-    # 3. N봉 종가 시각 도달?
+    # 4. N봉 종가 시각 도달?
     now = datetime.now(UTC)
     max_hold_until = parse_iso_utc(pos['max_hold_until'])
     if now >= max_hold_until:
@@ -268,9 +366,14 @@ def check_cycle_status(executor: BinanceFuturesExecutor):
 
 def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
     """
-    시그널 발생 → 진입 + TP/SL 3개 주문 제출
-    TP/SL은 진입봉 시가 기준 계산
-    진입 주문은 N봉 종가까지 유지 (GTC)
+    시그널 발생 → 진입 LIMIT 주문만 제출
+    
+    새 흐름 (잔고 효율 + 안전):
+    1. 진입 LIMIT만 제출 (증거금 1배만 묶음)
+    2. DB에 사이클 등록 (tp/sl_order_id는 NULL)
+    3. 5분마다 check_cycle_status가 진입 체결 확인
+    4. 체결되면 TP/SL 부착 (reduceOnly=True 사용)
+    5. 8봉 만료까지 미체결이면 진입 주문 취소
     """
     # 이미 사이클 진행 중이면 스킵 (미체결 대기 포함)
     if db.get_open_position():
@@ -309,7 +412,7 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
         f"TP={tp_price:.2f} SL={sl_price:.2f} 수량={quantity}"
     )
     
-    # 1. 진입 지정가 주문
+    # 1. 진입 지정가 주문만 먼저 제출 (TP/SL은 체결 후 부착)
     try:
         entry_order = executor.place_entry_limit(side, entry_limit, quantity)
     except Exception as e:
@@ -317,85 +420,11 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
         notifier.notify_error(f"진입 주문 실패: {e}")
         return
     
-    # 2. TP/SL 주문 (재시도 로직 포함)
-    tp_order, sl_order = None, None
-    last_error = None
-    
-    for attempt in range(3):  # 최대 3회 재시도
-        try:
-            tp_order, sl_order = executor.place_tp_sl_limit(
-                side, quantity, tp_price, sl_price
-            )
-            if attempt > 0:
-                logger.info(f"TP/SL 주문 성공 (재시도 {attempt}회 후)")
-            break  # 성공
-        except Exception as e:
-            last_error = e
-            logger.warning(f"TP/SL 주문 실패 (시도 {attempt+1}/3): {e}")
-            if attempt < 2:
-                time.sleep(3)  # 3초 대기 후 재시도
-    
-    if tp_order is None:
-        # 3회 재시도 모두 실패
-        logger.exception(f"TP/SL 주문 3회 재시도 모두 실패: {last_error}")
-        
-        # 진입 체결 여부 확인
-        try:
-            entry_filled, _ = is_entry_filled(executor, {
-                'entry_order_id': str(entry_order.get('orderId')),
-                'entry_price': entry_limit
-            })
-        except Exception:
-            entry_filled = False
-        
-        if entry_filled:
-            # 진입 체결된 상태 → 자동 청산 안 함, 사람이 결정하도록 긴급 알림
-            logger.critical("⚠️ 진입 체결됨 + TP/SL 실패 → 사용자 수동 처리 필요")
-            notifier.send_telegram(
-                f"🚨 <b>긴급! 수동 TP/SL 설정 필요!</b>\n\n"
-                f"진입은 체결됐으나 TP/SL 주문이 3회 실패했습니다.\n"
-                f"<b>지금 즉시 바이낸스 앱에서 TP/SL을 수동 설정하세요!</b>\n\n"
-                f"방향: {side}\n"
-                f"수량: {quantity} BTC\n"
-                f"진입가: {entry_limit:.2f}\n"
-                f"권장 TP: {tp_price:.2f}\n"
-                f"권장 SL: {sl_price:.2f}\n\n"
-                f"⚠️ 봇은 자동 청산하지 않습니다.\n"
-                f"청산 후엔 봇이 5분 내 자동 감지하여 사이클 종료합니다.\n\n"
-                f"에러: {str(last_error)[:150]}"
-            )
-            
-            # DB에 사이클 등록 (봇이 청산 감지하도록)
-            bar_start = get_current_bar_open_time()
-            max_hold_until = bar_start + timedelta(hours=4 * config.MAX_HOLD_BARS)
-            db.save_position({
-                'side': side,
-                'entry_time': datetime.now(UTC).isoformat(),
-                'entry_price': entry_limit,
-                'entry_open_price': bar_open_price,
-                'quantity': quantity,
-                'leverage': config.LEVERAGE,
-                'tp_price': tp_price,
-                'sl_price': sl_price,
-                'entry_bar_time': bar_start.isoformat(),
-                'max_hold_until': max_hold_until.isoformat(),
-                'entry_order_id': str(entry_order.get('orderId')),
-                'tp_order_id': 'MANUAL',  # 수동 설정 표시
-                'sl_order_id': 'MANUAL',
-            })
-            logger.info("진입 사이클 DB 등록 완료 (TP/SL은 사용자가 수동 설정)")
-        else:
-            # 진입 미체결 → 진입 주문 취소
-            executor.cancel_order(entry_order.get('orderId'))
-            notifier.notify_error(f"TP/SL 3회 실패 - 진입 취소: {last_error}")
-        return
-    
-    # 3. 진입봉 시작 시각 + N봉 = 청산 시각
-    # 진입봉 포함 N봉이므로, 진입봉 시작 + (N × 4시간) 시점이 N봉 종가
+    # 2. 진입봉 시작 시각 + N봉 = 청산 시각
     bar_start = get_current_bar_open_time()
     max_hold_until = bar_start + timedelta(hours=4 * config.MAX_HOLD_BARS)
     
-    # 4. DB 저장
+    # 3. DB 저장 (TP/SL은 아직 부착 전이므로 NULL)
     position_id = db.save_position({
         'side': side,
         'entry_time': datetime.now(UTC).isoformat(),
@@ -408,8 +437,8 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
         'entry_bar_time': bar_start.isoformat(),
         'max_hold_until': max_hold_until.isoformat(),
         'entry_order_id': str(entry_order.get('orderId')),
-        'tp_order_id': str(tp_order.get('orderId')),
-        'sl_order_id': str(sl_order.get('orderId')),
+        'tp_order_id': None,  # 아직 부착 안 됨
+        'sl_order_id': None,
     })
     
     signal['executed'] = True
@@ -417,8 +446,8 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
     notifier.notify_entry(side, entry_limit, quantity, tp_price, sl_price)
     
     logger.info(
-        f"사이클 시작 (id={position_id}) - "
-        f"N봉 청산 시각={max_hold_until.isoformat()}"
+        f"사이클 시작 (id={position_id}) - 진입 LIMIT 제출됨, "
+        f"체결 후 TP/SL 자동 부착, N봉 청산={max_hold_until.isoformat()}"
     )
 
 
@@ -440,11 +469,23 @@ def run_bot():
             check_time = next_close + timedelta(seconds=config.SIGNAL_CHECK_DELAY_SECONDS)
             logger.info(f"다음 체크: {check_time.isoformat()}")
             
-            # 2. 대기 루프 (5분마다 사이클 상태 체크)
+            # 2. 대기 루프 (적응형 체크 주기)
+            #    - 진입 미체결 사이클 있음 → 10초마다 (체결 즉시 TP/SL 부착)
+            #    - 체결됐거나 사이클 없음 → 5분마다 (효율적)
             while datetime.now(UTC) < check_time:
                 check_cycle_status(executor)
+                
+                # 다음 체크 주기 결정
+                pos = db.get_open_position()
+                if pos and (not pos.get('tp_order_id') or not pos.get('sl_order_id')):
+                    # 진입 미체결 사이클 있음 → 짧게 (10초)
+                    sleep_sec = 10
+                else:
+                    # 평상시 → 5분
+                    sleep_sec = 300
+                
                 remaining = (check_time - datetime.now(UTC)).total_seconds()
-                time.sleep(min(max(remaining, 1), 300))
+                time.sleep(min(max(remaining, 1), sleep_sec))
             
             logger.info("=== 4시간봉 마감 ===")
             
