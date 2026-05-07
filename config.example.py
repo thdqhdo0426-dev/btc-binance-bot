@@ -26,6 +26,12 @@ TIMEFRAME = "4h"
 POSITION_SIZE_USDT = 400.0
 LEVERAGE = 1
 
+# 마진 모드 (ISOLATED 또는 CROSSED)
+# ISOLATED (격리): 포지션마다 격리된 증거금. 손실이 격리 증거금으로 제한 (안전)
+# CROSSED  (교차): 전체 잔고를 증거금으로. 청산 가격 멀음 (큰 변동에 강함)
+# 봇 운영에는 ISOLATED 권장 (자금 격리로 안전)
+MARGIN_TYPE = "ISOLATED"
+
 # ==================== 진입 조건 ====================
 BREAKOUT_LOOKBACK = 20
 EMA_PERIOD = 200

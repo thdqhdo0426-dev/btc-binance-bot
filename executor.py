@@ -80,6 +80,34 @@ class BinanceFuturesExecutor:
         except Exception as e:
             logger.warning(f"레버리지 설정 실패 (이미 설정되어 있을 수 있음): {e}")
     
+    def set_margin_type(self, margin_type: str = "ISOLATED"):
+        """
+        마진 모드 설정
+        - ISOLATED (격리): 포지션마다 격리된 증거금
+        - CROSSED  (교차): 전체 잔고를 증거금으로
+        
+        ⚠️ 포지션 보유 중에는 변경 불가 (바이낸스 정책)
+        ⚠️ 이미 같은 모드면 'No need to change' 에러 (정상)
+        """
+        margin_type = margin_type.upper()
+        if margin_type not in ("ISOLATED", "CROSSED"):
+            logger.warning(f"잘못된 마진 모드: {margin_type}. ISOLATED 또는 CROSSED만 가능")
+            return
+        
+        try:
+            self.client.futures_change_margin_type(
+                symbol=self.symbol, marginType=margin_type
+            )
+            logger.info(f"마진 모드 {margin_type} 설정 완료")
+        except Exception as e:
+            err_msg = str(e)
+            if 'No need to change' in err_msg or '-4046' in err_msg:
+                logger.info(f"마진 모드 이미 {margin_type}")
+            elif 'open positions' in err_msg.lower() or '-4048' in err_msg:
+                logger.warning(f"포지션 보유 중이라 마진 모드 변경 불가 (현재 모드 유지)")
+            else:
+                logger.warning(f"마진 모드 설정 실패: {e}")
+    
     def get_klines(self, limit: int = 300):
         """캔들 데이터 조회"""
         klines = self.client.futures_klines(

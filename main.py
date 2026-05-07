@@ -528,6 +528,8 @@ def run_bot():
     db.init_db()
     executor = BinanceFuturesExecutor()
     executor.set_leverage(config.LEVERAGE)
+    # 마진 모드 설정 (config.py에 MARGIN_TYPE 있으면 사용, 없으면 CROSSED 기본)
+    executor.set_margin_type(getattr(config, 'MARGIN_TYPE', 'CROSSED'))
     notifier.notify_startup()
     
     logger.info("봇 시작 - 메인 루프 진입")
