@@ -465,13 +465,14 @@ def handle_last():
 _last_daily_report_date = None
 
 
-def maybe_send_daily_report(executor=None, hour: int = 9):
+def maybe_send_daily_report(executor=None, hour: int = 12, minute: int = 0):
     """
     매일 지정된 시각(KST)에 한 번 자동 보고
     
     Args:
         executor: BinanceFuturesExecutor 인스턴스
-        hour: 보고 시각 (KST, 기본 9시)
+        hour: 보고 시각 시 (KST, 기본 12시)
+        minute: 보고 시각 분 (KST, 기본 0분)
     """
     global _last_daily_report_date
     
@@ -484,23 +485,19 @@ def maybe_send_daily_report(executor=None, hour: int = 9):
         return
     
     # 지정된 시각 이전이면 스킵
-    if now_kst.hour < hour:
+    target_total_min = hour * 60 + minute
+    now_total_min = now_kst.hour * 60 + now_kst.minute
+    
+    if now_total_min < target_total_min:
         return
     
-    # 자정 ~ 보고 시각 사이에 봇이 시작됐을 수도 있으므로,
-    # 보고 시각 + 5분 안에 있을 때만 보고 (너무 늦으면 스킵)
-    if now_kst.hour == hour and now_kst.minute > 5:
-        # 오늘 봇이 이 시각 이후에 시작된 경우 등
-        # 그래도 한 번은 보내야 함 → 기록만 하고 다음날부터 정상 작동
+    # 너무 늦게 봇이 시작된 경우 (목표 시각 + 5분 이상 지남)
+    # 오늘은 보고 안 하고 내일부터 정상 작동
+    if now_total_min > target_total_min + 5:
         _last_daily_report_date = today
         return
     
-    # 보고 시각 한참 지나서 봇 시작된 경우 (예: 17시에 봇 시작)
-    if now_kst.hour > hour:
-        _last_daily_report_date = today
-        return
-    
-    # 정상 보고 시각 도달
+    # 정상 보고 시각 도달 (목표 시각 ~ +5분 이내)
     _last_daily_report_date = today
     
     try:

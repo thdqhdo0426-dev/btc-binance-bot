@@ -532,13 +532,10 @@ def run_bot():
     executor.set_margin_type(getattr(config, 'MARGIN_TYPE', 'CROSSED'))
     notifier.notify_startup()
     
-    # 텔레그램 명령어 처리를 위해 update_id 초기화 (이전 메시지들 무시)
-    notifier.init_update_id()
-    
     logger.info("봇 시작 - 메인 루프 진입")
     
-    # 텔레그램 명령어 체크 카운터 (너무 자주 호출 안 하도록)
-    last_command_check = datetime.now(UTC)
+    # 텔레그램 명령어 처리 비활성화 (가상 TP/SL 모니터링 우선)
+    # 일일 보고만 매일 09:30 KST에 자동 발송
     last_daily_check = datetime.now(UTC)
     
     while True:
@@ -555,18 +552,10 @@ def run_bot():
             while datetime.now(UTC) < check_time:
                 now = datetime.now(UTC)
                 
-                # 텔레그램 명령어 체크 (5초마다)
-                if (now - last_command_check).total_seconds() >= 5:
-                    try:
-                        notifier.process_commands(executor)
-                    except Exception as e:
-                        logger.warning(f"텔레그램 명령어 처리 실패: {e}")
-                    last_command_check = now
-                
-                # 일일 보고 체크 (1분마다)
+                # 일일 보고 체크 (1분마다, 12시 정각 KST에 자동 발송)
                 if (now - last_daily_check).total_seconds() >= 60:
                     try:
-                        notifier.maybe_send_daily_report(executor, hour=9)
+                        notifier.maybe_send_daily_report(executor, hour=12, minute=0)
                     except Exception as e:
                         logger.warning(f"일일 보고 실패: {e}")
                     last_daily_check = now
