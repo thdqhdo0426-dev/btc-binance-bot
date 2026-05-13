@@ -532,7 +532,14 @@ def run_bot():
     executor.set_margin_type(getattr(config, 'MARGIN_TYPE', 'CROSSED'))
     notifier.notify_startup()
     
+    # 텔레그램 명령어 처리를 위해 update_id 초기화 (이전 메시지들 무시)
+    notifier.init_update_id()
+    
     logger.info("봇 시작 - 메인 루프 진입")
+    
+    # 텔레그램 명령어 체크 카운터 (너무 자주 호출 안 하도록)
+    last_command_check = datetime.now(UTC)
+    last_daily_check = datetime.now(UTC)
     
     while True:
         try:
@@ -546,6 +553,24 @@ def run_bot():
             #    - 진입 미체결 사이클 있음    → 10초마다 (체결 감지)
             #    - 사이클 없음               → 5분마다 (효율적)
             while datetime.now(UTC) < check_time:
+                now = datetime.now(UTC)
+                
+                # 텔레그램 명령어 체크 (5초마다)
+                if (now - last_command_check).total_seconds() >= 5:
+                    try:
+                        notifier.process_commands(executor)
+                    except Exception as e:
+                        logger.warning(f"텔레그램 명령어 처리 실패: {e}")
+                    last_command_check = now
+                
+                # 일일 보고 체크 (1분마다)
+                if (now - last_daily_check).total_seconds() >= 60:
+                    try:
+                        notifier.maybe_send_daily_report(executor, hour=9)
+                    except Exception as e:
+                        logger.warning(f"일일 보고 실패: {e}")
+                    last_daily_check = now
+                
                 # 1. 가상 TP/SL 체크 (포지션 보유 시 0.33초마다)
                 pos = db.get_open_position()
                 
