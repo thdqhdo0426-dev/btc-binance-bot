@@ -470,7 +470,11 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
         sl_price = bar_open_price * (1 + config.STOP_LOSS_PCT)
     
     try:
-        quantity = executor.calculate_quantity(bar_open_price)
+        # 풀복리 + NATR 비중 조절: 신호봉 NATR을 전달하여 비중 결정
+        signal_natr = signal.get('natr')
+        quantity, qty_info = executor.calculate_quantity(
+            bar_open_price, natr=signal_natr, return_info=True
+        )
     except ValueError as e:
         logger.error(f"수량 계산 실패 - 사이클 시작 불가: {e}")
         notifier.notify_error(f"수량 부족으로 진입 불가: {e}")
@@ -513,7 +517,12 @@ def try_enter_position(executor: BinanceFuturesExecutor, signal: dict):
     
     signal['executed'] = True
     db.log_signal({**signal, 'check_time': datetime.now().isoformat()})
-    notifier.notify_entry(side, entry_limit, quantity, tp_price, sl_price)
+    notifier.notify_entry(
+        side, entry_limit, quantity, tp_price, sl_price,
+        capital=qty_info.get('capital'),
+        weight=qty_info.get('weight'),
+        natr=qty_info.get('natr'),
+    )
     
     logger.info(
         f"사이클 시작 (id={position_id}) - 진입 LIMIT 제출됨, "

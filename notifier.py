@@ -61,15 +61,54 @@ def notify_signal(signal: dict):
     )
 
 
-def notify_entry(side: str, entry_price: float, qty: float, tp: float, sl: float):
+def notify_entry(side: str, entry_price: float, qty: float, tp: float, sl: float,
+                 capital: float = None, weight: float = None, natr: float = None):
+    """
+    진입 알림
+    
+    Args:
+        side: LONG / SHORT
+        entry_price: 진입 지정가
+        qty: 수량 (BTC)
+        tp: TP 가격
+        sl: SL 가격
+        capital: 현재 자본 (USDT) - 풀복리 정보 표시용
+        weight: 비중 (0.5 또는 1.0) - NATR 비중 조절 표시용
+        natr: 신호봉 NATR - 비중 결정 근거 표시용
+    """
     emoji = "🟢" if side == "LONG" else "🔴"
-    send_telegram(
-        f"{emoji} <b>진입 체결: {side}</b>\n"
+    notional = qty * entry_price
+    
+    msg = (
+        f"{emoji} <b>진입 주문: {side}</b>\n"
         f"진입가: {entry_price:.2f}\n"
         f"수량: {qty:.4f} BTC\n"
-        f"TP: {tp:.2f}\n"
-        f"SL: {sl:.2f}"
+        f"명목: {notional:.2f} USDT\n"
     )
+    
+    # 비중 정보 추가 (풀복리 모드)
+    if weight is not None:
+        weight_pct = int(weight * 100)
+        weight_emoji = "💯" if weight == 1.0 else "⚖️"
+        msg += f"{weight_emoji} 비중: {weight_pct}%"
+        if natr is not None:
+            if weight == 0.5:
+                msg += f" (NATR {natr:.2f} 위험구간)\n"
+            else:
+                msg += f" (NATR {natr:.2f})\n"
+        else:
+            msg += "\n"
+    
+    if capital is not None:
+        msg += f"💰 자본: {capital:.2f} USDT\n"
+    
+    msg += (
+        f"\n"
+        f"🎯 TP: {tp:.2f}\n"
+        f"🛡 SL: {sl:.2f}"
+    )
+    
+    send_telegram(msg)
 
 
 def notify_exit(side: str, exit_price: float, pnl_usdt: float, pnl_pct: float, reason: str):

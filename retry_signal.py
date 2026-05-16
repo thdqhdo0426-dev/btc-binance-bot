@@ -127,7 +127,11 @@ def retry_signal():
         sl_price = bar_open_price * (1 + config.STOP_LOSS_PCT)
     
     try:
-        quantity = executor.calculate_quantity(bar_open_price)
+        # 풀복리 + NATR 비중 조절
+        signal_natr = signal.get('natr')
+        quantity, qty_info = executor.calculate_quantity(
+            bar_open_price, natr=signal_natr, return_info=True
+        )
     except ValueError as e:
         print("\n[ERROR] Qty calc failed: {}".format(e))
         sys.exit(1)
@@ -200,7 +204,12 @@ def retry_signal():
     
     try:
         notifier.notify_signal(signal)
-        notifier.notify_entry(side, entry_limit, quantity, tp_price, sl_price)
+        notifier.notify_entry(
+            side, entry_limit, quantity, tp_price, sl_price,
+            capital=qty_info.get('capital'),
+            weight=qty_info.get('weight'),
+            natr=qty_info.get('natr'),
+        )
     except Exception as e:
         logger.warning("Telegram notify failed: {}".format(e))
     

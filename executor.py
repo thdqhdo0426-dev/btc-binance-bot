@@ -30,6 +30,23 @@ class BinanceFuturesExecutor:
             testnet=config.USE_TESTNET
         )
         
+        # recvWindow를 60초로 설정 (기본 5초 → 60초)
+        # -1021 (Timestamp out of recvWindow) 에러 방지
+        # 네트워크 지연이나 시간 동기화 미세 차이에도 안정적으로 작동
+        self.client.RECV_WINDOW = 60000  # 60초 (밀리초 단위)
+        
+        # 모든 futures API 호출에 recvWindow 자동 적용을 위해
+        # 원본 메서드를 래핑
+        original_request = self.client._request
+        def request_with_recv_window(method, uri, signed, force_params=False, **kwargs):
+            if signed:
+                if 'data' not in kwargs:
+                    kwargs['data'] = {}
+                if isinstance(kwargs['data'], dict) and 'recvWindow' not in kwargs['data']:
+                    kwargs['data']['recvWindow'] = 60000
+            return original_request(method, uri, signed, force_params, **kwargs)
+        self.client._request = request_with_recv_window
+        
         # 데모 모드: 엔드포인트를 데모 서버로 강제 변경
         if getattr(config, 'USE_DEMO', False):
             self.client.FUTURES_URL = 'https://demo-fapi.binance.com/fapi'
@@ -147,23 +164,86 @@ class BinanceFuturesExecutor:
         # [open_time, open, high, low, close, ...]
         return float(klines[0][1])
     
-    def calculate_quantity(self, entry_price: float) -> float:
+    def get_available_capital(self) -> float:
         """
-        투입할 수량 계산 + 최소 주문량/금액 검증
-        수량 = (증거금 * 레버리지) / 진입가
+        선물 지갑의 사용 가능한 자본 조회 (USDT)
+        풀복리 운용을 위해 매 거래마다 호출
         """
-        notional = config.POSITION_SIZE_USDT * config.LEVERAGE
+        try:
+            balance = self.client.futures_account_balance()
+            for b in balance:
+                if b['asset'] == 'USDT':
+                    # totalWalletBalance: 총 자본 (미실현 손익 포함 안 함)
+                    # availableBalance: 즉시 사용 가능 (다른 포지션에 묶인 거 제외)
+                    # 풀복리는 totalWalletBalance 기준으로 (마진 묶임 무관하게 계산)
+                    capital = float(b.get('balance', 0))
+                    logger.info(f"현재 자본: {capital:.2f} USDT")
+                    return capital
+            return 0.0
+        except Exception as e:
+            logger.error(f"자본 조회 실패: {e}")
+            return 0.0
+    
+    def calculate_quantity(self, entry_price: float, natr: float = None, return_info: bool = False):
+        """
+        투입할 수량 계산 (풀복리 + NATR 비중 조절)
+        
+        풀복리 운용:
+            매 거래마다 현재 자본을 조회하여 명목 사이즈 계산
+            기본 명목 = 현재 자본 × 레버리지(3x)
+        
+        NATR 기반 비중 조절:
+            NATR 1.39 이상 1.69 미만 → 비중 50% (명목 × 0.5)
+            그 외                    → 비중 100% (명목 × 1.0)
+        
+        최종 수량 = 명목 / 진입가 → 거래소 step 단위로 반올림
+        
+        Args:
+            entry_price: 진입 가격
+            natr: 신호봉의 NATR(14) 값. None이면 비중 100%로 처리
+            return_info: True면 (수량, 정보 dict) 튜플 반환
+        
+        Returns:
+            return_info=False: 주문 수량 (BTC) - float
+            return_info=True: (수량, {'capital', 'weight', 'natr', 'notional'}) - tuple
+        """
+        # 1. 현재 자본 조회 (풀복리)
+        capital = self.get_available_capital()
+        if capital <= 0:
+            raise ValueError(f"자본 조회 실패 또는 0: {capital}")
+        
+        # 2. 기본 명목 = 자본 × 레버리지
+        base_notional = capital * config.LEVERAGE
+        
+        # 3. NATR 기반 비중 조절
+        if natr is not None and 1.39 <= natr < 1.69:
+            weight = 0.5
+            weight_reason = f"NATR {natr:.2f} (1.39 ≤ NATR < 1.69) → 비중 50%"
+        else:
+            weight = 1.0
+            weight_reason = f"NATR {natr:.2f} → 비중 100%" if natr is not None else "NATR 없음 → 비중 100%"
+        
+        notional = base_notional * weight
+        
+        # 4. 수량 계산
         qty = notional / entry_price
         rounded = self._round_qty(qty)
         
-        # 최소 수량 체크 (바이낸스 LOT_SIZE 필터)
+        logger.info(
+            f"수량 계산 [풀복리]: "
+            f"자본={capital:.2f} × 레버리지={config.LEVERAGE} × 비중={weight} "
+            f"= 명목 {notional:.2f} USDT → 수량 {rounded} BTC"
+        )
+        logger.info(f"  비중 결정: {weight_reason}")
+        
+        # 5. 최소 수량 체크 (바이낸스 LOT_SIZE 필터)
         if self._step_size and rounded < self._step_size:
             logger.error(
                 f"⚠️ 주문 수량이 최소 단위 미달! "
                 f"계산={qty:.6f} BTC, 반올림={rounded}, 최소={self._step_size}"
             )
             logger.error(
-                f"  → POSITION_SIZE_USDT * LEVERAGE = {notional} USDT"
+                f"  → 자본 * 레버리지 * 비중 = {notional} USDT"
             )
             min_usdt = self._step_size * entry_price
             logger.error(
@@ -171,7 +251,7 @@ class BinanceFuturesExecutor:
             )
             raise ValueError(f"주문 수량 부족: {rounded} < {self._step_size}")
         
-        # 최소 노셔널 체크 (50 USDT)
+        # 6. 최소 노셔널 체크 (50 USDT)
         actual_notional = rounded * entry_price
         if actual_notional < 50:
             logger.warning(
@@ -179,6 +259,14 @@ class BinanceFuturesExecutor:
             )
         
         logger.info(f"수량 계산: {rounded} BTC (노셔널 {actual_notional:.2f} USDT)")
+        
+        if return_info:
+            return rounded, {
+                'capital': capital,
+                'weight': weight,
+                'natr': natr,
+                'notional': actual_notional,
+            }
         return rounded
     
     def place_entry_limit(self, side: str, price: float, quantity: float) -> dict:
